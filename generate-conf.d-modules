@@ -1,0 +1,332 @@
+#!/bin/bash
+# Copyright 2016 Stuart Shelton
+# Distributed under the terms of the GNU General Public License v2
+
+set -u
+
+#
+# generate-modules.conf
+#
+# Create a file suitable for deployment to /etc/conf.d/modules on baselayout-2
+# Gentoo systems, based on currently loaded modules.  The modules list is
+# live-generated from the running system, with the option to attempt to load
+# all discovered modules and additionally list those which load successfully.
+# Additionally, modules parameters are also auto-populated.  Dependent modules
+# are listed with their options, but aren't explicitly loaded.
+#
+
+declare -i debug="${DEBUG:-0}"
+declare -i trace="${TRACE:-0}"
+
+declare INSTALL_MOD_PATH="${INSTALL_MOD_PATH:-/}"
+
+function die() {
+	echo >&2 "FATAL: ${*:-Unknown error}"
+	exit 1
+} # die
+
+function dbg() {
+	(( debug )) && echo >&2 "${*:-}"
+} # dbg
+
+function main() {
+	local -i modload=0 verbose=0
+	local -a messages=()
+	local -A modcat=()
+	local module category
+
+	if grep -Eq ' -(h|-help) ' <<<" ${*} "; then
+		echo "Usage: $( basename "${0}" ) [--load-all-modules]"
+		exit 0
+	fi
+	if grep -Eq ' -(d|-debug) ' <<<" ${*} "; then
+		debug=1
+	fi
+	if grep -Eq ' -(t|-trace) ' <<<" ${*} "; then
+		trace=1
+	fi
+	if grep -Eq ' -(v|-verbose) ' <<<" ${*} "; then
+		verbose=1
+	fi
+	if grep -Eq ' -(l|-load-all-modules) ' <<<" ${*} "; then
+		(( EUID )) && die "$( basename "${0}" ) must be executed as the super-user in order to load modules"
+		modload=1
+	fi
+
+	local modpath="${INSTALL_MOD_PATH%/}/lib/modules/$( uname -r )/kernel/"
+
+	[[ -d "${modpath}" ]] ||
+		die "Cannot locate kernel modules beneath '${modpath}'"
+
+	(( verbose )) && echo >&2 "Discovering modules for kernel $( uname -r ) ..."
+	while read -r module; do
+		[[ "$( dirname "${module}" )" == "." ]] && die "Malformed module name '${module}'"
+		#dbg "Adding module '${module}' ..."
+		modcat[$( basename "${module}" )]="$( dirname "${module}" )"
+
+		if (( modload )); then
+			local output="" olddmesg dmesg
+
+			module="$( basename "${module}" )"
+			if ! output="$( modprobe --use-blacklist --dry-run "${module}" 2>&1 )"; then
+				messages+=( "Simulated insertion of module '${module}' failed: ${output}" )
+			else
+				olddmesg="$( dmesg -tx )"
+				if ! output="$( modprobe --use-blacklist "${module}" 2>&1 )"; then
+					messages+=( "Insertion of module '${module}' failed: ${output}" )
+				else
+					(( debug )) && messages+=( "Insertion of module '${module}' succeeded${output:+: ${output}}" )
+				fi
+				dmesg="$( dmesg -tx )"
+				if [[ "${olddmesg}" != "${dmesg}" ]]; then
+					messages+=( "$( diff --text --suppress-common-lines <( cat <<<"${olddmesg}" ) <( cat <<<"${dmesg}" ) | tail -n +2 | grep -Ev '^(< | [0-9,]+a[0-9,]+$)' | sed "s/^> /${module}: /g" )" )
+				fi
+			fi
+		fi
+	done < <(
+		find "${modpath}" -type f -name \*.ko\* |
+		sed "s|^.*/$( uname -r | sed 's/\./\\./g' )/kernel/||" |
+		sed 's/\.ko\(\..*\)\?$//'
+	)
+
+	unset modpath
+
+	local -i repeat=1 number
+
+	(( verbose )) && echo >&2 "Collapsing categories ..."
+	while (( repeat )); do
+		repeat=0
+
+		while read -r number category; do
+			if (( 1 == number )); then
+				if [[ "${category}" =~ / ]]; then
+					local mod=""
+
+					for module in "${!modcat[@]}"; do
+						# We actually need to scan everything in order to check for
+						# common categories (e.g. not reducing 'arch/x86/platform/intel'
+						# to 'arch' when 'arch/x86/kernel' and 'arch/x86/crypto' exist)
+						# To do this we need to skip cases where the category exists as
+						# a prefix...
+						if [[ "${modcat[${module}]}" =~ ^${category}/ ]]; then
+							mod=""
+							#dbg "Found common root category '${category}/' for '${modcat[${module}]}' (used by at least '${module}') - breaking"
+							break
+						fi
+						if [[ "${modcat[${module}]}" == "${category}" ]]; then
+							mod="${module}"
+							#dbg "Found single module '${mod}' for '${category}'"
+						fi
+					done
+					if [[ -n "${mod}" ]]; then
+						dbg "Adjusting category for '${mod}' from '${category}' to '$( dirname "${category}" )'"
+						modcat[${mod}]="$( dirname "${category}" )"
+						repeat=1
+					fi
+
+					unset mod
+				fi
+			fi
+		done < <(
+			for module in "${!modcat[@]}"; do
+				echo "${modcat[${module}]}"
+			done | sort | uniq -c
+		)
+		#(( repeat )) && dbg "Looping"
+	done
+
+	if (( debug )); then
+		echo >&2 "Discovered categories:"
+		for module in "${!modcat[@]}"; do
+			echo "${modcat[${module}]}"
+		done | sort | uniq -c >&2
+	fi
+
+	(( verbose )) && echo >&2 "Producing output file ..."
+	cat <<-EOF
+# /etc/conf.d/modules
+
+# You can define a list modules for a specific kernel version,
+# a released kernel version, a main kernel version or just a list.
+# The most specific versioned variable will take precedence.
+#modules_2_6_23_gentoo_r5="ieee1394 ohci1394"
+#modules_2_6_23="tun ieee1394"
+#modules_2_6="tun"
+#modules_2="ipv6"
+#modules="ohci1394"
+
+# You can give modules a different name when they load - the new name
+# will also be used to pick arguments below.
+#modules="dummy:dummy1"
+
+# Give the modules some arguments if needed, per version if necessary.
+# Again, the most specific versioned variable will take precedence.
+#module_ieee1394_args="debug"
+#module_ieee1394_args_2_6_23_gentoo_r5="debug2"
+#module_ieee1394_args_2_6_23="debug3"
+#module_ieee1394_args_2_6="debug4"
+#module_ieee1394_args_2="debug5"
+
+# You should consult your kernel documentation and configuration
+# for a list of modules and their options.
+
+modules=""
+	EOF
+
+	#local -a loaded
+	#loaded=( $( lsmod | tail -n +2 | cut -d' ' -f 1 ) )
+
+	local -a autoloaded
+	autoloaded=( $( lsmod | tail -n +2 | sed 's/^\([a-zA-Z0-9_]\+\)\s\+\([0-9]\+\)\s\+\([0-9]\+\)\s*\(.*\)\?$/\1: \4/ ; s/,/ /g' | grep -v ': $' | cut -d':' -f 1 ) )
+
+	local -a requested
+	requested=( $( lsmod | tail -n +2 | grep '\s[0-9]\+\s\+[0-9]\+$' | cut -d' ' -f 1 ) )
+
+	if (( ${#requested[@]} )); then
+		for category in $(
+			for module in "${!modcat[@]}"; do
+				echo "${modcat[${module}]}"
+			done | LC_ALL=C sort | uniq
+		); do
+			local -a list=()
+
+			for module in "${!modcat[@]}"; do
+				[[ "${modcat[${module}]}" == "${category}" ]] &&
+					grep -qw "${module}" <<<"${requested[*]}" &&
+					list+=( "${module}" )
+			done
+			(( ${#list[@]} )) && echo -e "\n# ${category}:\n#\nmodules=\"\${modules} ${list[*]}\""
+
+			unset list
+
+			local -i output=0
+			local entry key desc type
+
+			for module in "${!modcat[@]}"; do
+				if [[ "${modcat[${module}]}" == "${category}" ]]; then
+					if grep -qw "${module}" <<<"${requested[*]}"; then
+						if modinfo "${module}" | grep -q '^parm:'; then
+							output=0
+							echo -n "#module_${module//-/_}_args=\""
+							while read -r entry; do
+								key="$( cut -d':' -f 1 <<<"${entry}" )"
+								if [[ "${entry}" == "${key}:bool" ]]; then
+									type="bool"
+									desc="None provided"
+								else
+									type="$( rev <<<"${entry}" | grep -o '^)[^(]\+(' | rev | sed 's/[()]//g' )"
+									desc="$( sed "s/^${key}:\(.*\) (${type})/\1/" <<<"${entry}" )"
+								fi
+
+								(( output )) && echo -n ','
+								if [[ -n "${type}" ]]; then
+									echo -n "${key}=(${type})"
+								else
+									echo -n "${key}"
+								fi
+								output=1
+							done < <(
+								modinfo "${module}" |
+								grep '^parm:' |
+								sed 's/^parm:\s\+//'
+							)
+							echo '"'
+						fi
+					fi
+				fi
+			done | LC_ALL=C sort | uniq
+
+			unset type desc key entry output
+		done
+	fi
+
+	if (( ${#autoloaded[@]} )); then
+		cat <<-EOF
+
+# Dependent modules
+#
+# The following modules were loaded as dependencies of the modules above,
+# rather than necessarily being directly required...
+#
+		EOF
+		for category in $(
+			for module in "${!modcat[@]}"; do
+				echo "${modcat[${module}]}"
+			done | LC_ALL=C sort | uniq
+		); do
+			local -a list=()
+
+			for module in "${!modcat[@]}"; do
+				[[ "${modcat[${module}]}" == "${category}" ]] &&
+					grep -qw "${module}" <<<"${autoloaded[*]}" &&
+					list+=( "${module}" )
+			done
+			(( ${#list[@]} )) && echo -e "\n# ${category}:\n#\n#modules=\"\${modules} ${list[*]}\""
+
+			unset list
+
+			local -i output=0
+			local entry key desc type
+
+			for module in "${!modcat[@]}"; do
+				if [[ "${modcat[${module}]}" == "${category}" ]]; then
+					if grep -qw "${module}" <<<"${autoloaded[*]}"; then
+						if modinfo "${module}" | grep -q '^parm:'; then
+							output=0
+							echo -n "#module_${module//-/_}_args=\""
+							while read -r entry; do
+								key="$( cut -d':' -f 1 <<<"${entry}" )"
+								if [[ "${entry}" == "${key}:bool" ]]; then
+									type="bool"
+									desc=""
+								else
+									type="$( rev <<<"${entry}" | grep -o '^)[^(]\+(' | rev | sed 's/[()]//g' )"
+									desc="$( sed "s/^${key}:\(.*\) (${type})/\1/" <<<"${entry}" )"
+								fi
+
+								(( output )) && echo -n ','
+								if [[ -n "${type}" ]]; then
+									echo -n "${key}=(${type})"
+								else
+									echo -n "${key}"
+								fi
+								output=1
+							done < <(
+								modinfo "${module}" |
+								grep '^parm:' |
+								sed 's/^parm:\s\+//'
+							)
+							echo '"'
+						fi
+					fi
+				fi
+			done | LC_ALL=C sort | uniq
+
+			unset type desc key entry output
+		done
+	fi
+
+	cat <<-EOF
+
+# vi: set nowrap syntax=conf:
+	EOF
+
+	unset requested autoloaded # loaded
+
+	if (( "${#messages[@]}" )); then
+		local message
+
+		(( verbose )) && echo >&2 -e "\nModule load results ..."
+		echo >&2
+		for message in "${messages[@]}"; do
+			echo >&2 "${message}"
+		done
+
+		unset message
+	fi
+} # main
+
+main "${@:-}"
+exit ${?}
+
+# vi: set syntax=sh:

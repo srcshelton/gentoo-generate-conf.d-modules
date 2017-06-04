@@ -26,17 +26,18 @@ function die() {
 } # die
 
 function dbg() {
-	(( debug )) && echo >&2 "${*:-}"
+	(( debug )) && echo >&2 "DEBUG: ${*:-}"
 } # dbg
 
 function main() {
 	local -i modload=0 verbose=0
-	local -a messages=()
+	local -a messages=() categories=()
 	local -A modcat=()
-	local module category
+	local watch watchcat
+	local module name category
 
 	if grep -Eq ' -(h|-help) ' <<<" ${*} "; then
-		echo "Usage: $( basename "${0}" ) [--load-all-modules]"
+		echo "Usage: $( basename "${0}" ) [--verbose] [--debug] [--trace] [--load-all-modules] [--watch <module>]"
 		exit 0
 	fi
 	if grep -Eq ' -(d|-debug) ' <<<" ${*} "; then
@@ -48,48 +49,68 @@ function main() {
 	if grep -Eq ' -(v|-verbose) ' <<<" ${*} "; then
 		verbose=1
 	fi
+	if grep -Eq ' -(w|-watch)\s+[^[:space:]]+ ' <<<" ${*} "; then
+		watch="$( grep -Eo ' -(w|-watch)\s+[^[:space:]]+ ' <<<" ${*} " | tr -s '[:space:]' | cut -d' ' -f 3- | sed 's/\s*$// ; s/-/_/g' )"
+
+		[[ -n "${watch:-}" ]] || die "Cannot identify module to watch from parameters '${*:-}'"
+
+		echo >&2 "NOTICE: Watching module '${watch:-}'"
+	fi
 	if grep -Eq ' -(l|-load-all-modules) ' <<<" ${*} "; then
 		(( EUID )) && die "$( basename "${0}" ) must be executed as the super-user in order to load modules"
 		modload=1
 	fi
 
-	local modpath="${INSTALL_MOD_PATH%/}/lib/modules/$( uname -r )/kernel/"
+	(( trace )) && set -o xtrace
 
+	local modpath
+	modpath="${INSTALL_MOD_PATH%/}/lib/modules/$( uname -r )/kernel/"
 	[[ -d "${modpath}" ]] ||
 		die "Cannot locate kernel modules beneath '${modpath}'"
 
 	(( verbose )) && echo >&2 "Discovering modules for kernel $( uname -r ) ..."
 	while read -r module; do
 		[[ "$( dirname "${module}" )" == "." ]] && die "Malformed module name '${module}'"
-		#dbg "Adding module '${module}' ..."
-		modcat[$( basename "${module}" )]="$( dirname "${module}" )"
+
+		name="$( basename "${module}" )"
+		category="$( dirname "${module}" )"
+		modcat["${name}"]="${category}"
+
+		dbg "Adding module '${name}' in category '${category}' ..."
+		if [[ -n "${watch:-}" && "${watch}" == "${name}" ]]; then
+			watchcat="${category}"
+			echo >&2 "NOTICE: Found watched module '${watch}' from filesystem in category '${watchcat}'"
+		fi
 
 		if (( modload )); then
 			local output="" olddmesg dmesg
 
-			module="$( basename "${module}" )"
-			if ! output="$( modprobe --use-blacklist --dry-run "${module}" 2>&1 )"; then
-				messages+=( "Simulated insertion of module '${module}' failed: ${output}" )
+			if ! output="$( modprobe --use-blacklist --dry-run "${name}" 2>&1 )"; then
+				messages+=( "Simulated insertion of module '${name}' failed: ${output}" )
 			else
 				olddmesg="$( dmesg -tx )"
-				if ! output="$( modprobe --use-blacklist "${module}" 2>&1 )"; then
-					messages+=( "Insertion of module '${module}' failed: ${output}" )
+				if ! output="$( modprobe --use-blacklist "${name}" 2>&1 )"; then
+					messages+=( "Insertion of module '${name}' failed: ${output}" )
 				else
-					(( debug )) && messages+=( "Insertion of module '${module}' succeeded${output:+: ${output}}" )
+					(( debug )) && messages+=( "Insertion of module '${name}' succeeded${output:+: ${output}}" )
 				fi
 				dmesg="$( dmesg -tx )"
 				if [[ "${olddmesg}" != "${dmesg}" ]]; then
-					messages+=( "$( diff --text --suppress-common-lines <( cat <<<"${olddmesg}" ) <( cat <<<"${dmesg}" ) | tail -n +2 | grep -Ev '^(< | [0-9,]+a[0-9,]+$)' | sed "s/^> /${module}: /g" )" )
+					messages+=( "$( diff --text --suppress-common-lines <( cat <<<"${olddmesg}" ) <( cat <<<"${dmesg}" ) | tail -n +2 | grep -Ev '^(< | [0-9,]+a[0-9,]+$)' | sed "s/^> /${name}: /g" )" )
 				fi
 			fi
 		fi
 	done < <(
 		find "${modpath}" -type f -name \*.ko\* |
 		sed "s|^.*/$( uname -r | sed 's/\./\\./g' )/kernel/||" |
-		sed 's/\.ko\(\..*\)\?$//'
+		sed 's/\.ko\(\..*\)\?$// ; s/-/_/g'
 	)
 
 	unset modpath
+
+	if [[ -n "${watch:-}" && -z "${watchcat:-}" ]]; then
+		die "Did not find sought module '${watch}' on filesystem"
+	fi
 
 	local -i repeat=1 number
 
@@ -100,46 +121,59 @@ function main() {
 		while read -r number category; do
 			if (( 1 == number )); then
 				if [[ "${category}" =~ / ]]; then
-					local mod=""
-
-					for module in "${!modcat[@]}"; do
+					for name in "${!modcat[@]}"; do
 						# We actually need to scan everything in order to check for
 						# common categories (e.g. not reducing 'arch/x86/platform/intel'
 						# to 'arch' when 'arch/x86/kernel' and 'arch/x86/crypto' exist)
 						# To do this we need to skip cases where the category exists as
 						# a prefix...
-						if [[ "${modcat[${module}]}" =~ ^${category}/ ]]; then
-							mod=""
-							#dbg "Found common root category '${category}/' for '${modcat[${module}]}' (used by at least '${module}') - breaking"
+						if [[ "${modcat["${name}"]}" =~ ^${category}/ ]]; then
+							module=""
+							#dbg "Found common root category '${category}/' for '${modcat["${name}"]}' (used by at least '${name}') - breaking"
 							break
 						fi
-						if [[ "${modcat[${module}]}" == "${category}" ]]; then
-							mod="${module}"
-							#dbg "Found single module '${mod}' for '${category}'"
+						if [[ "${modcat["${name}"]}" == "${category}" ]]; then
+							module="${name}"
+							#dbg "Found single module '${module}' for '${category}'"
 						fi
 					done
-					if [[ -n "${mod}" ]]; then
-						dbg "Adjusting category for '${mod}' from '${category}' to '$( dirname "${category}" )'"
-						modcat[${mod}]="$( dirname "${category}" )"
+
+					if [[ -n "${module}" ]]; then
+						dbg "Adjusting category for '${module}' from '${category}' to '$( dirname "${category}" )'"
+						modcat["${module}"]="$( dirname "${category}" )"
+
+						if [[ -n "${watch:-}" && "${watchcat}" == "${category}" ]]; then
+							echo >&2 "NOTICE: Watched module '${watch}' had category '${watchcat}', now reduced to '${modcat["${watch}"]}'"
+							watchcat="${modcat["${watch}"]}"
+						fi
+
 						repeat=1
 					fi
-
-					unset mod
 				fi
 			fi
 		done < <(
-			for module in "${!modcat[@]}"; do
-				echo "${modcat[${module}]}"
-			done | sort | uniq -c
+			for name in "${!modcat[@]}"; do
+				echo "${modcat["${name}"]}"
+			done | LC_ALL=C sort | uniq -c
 		)
+
 		#(( repeat )) && dbg "Looping"
 	done
 
+	readarray -t categories < <(
+		for module in "${!modcat[@]}"; do
+			echo "${modcat["${module}"]}"
+		done | LC_ALL=C sort | uniq 
+	)
 	if (( debug )); then
 		echo >&2 "Discovered categories:"
 		for module in "${!modcat[@]}"; do
-			echo "${modcat[${module}]}"
-		done | sort | uniq -c >&2
+			echo "${modcat["${module}"]}"
+		done | LC_ALL=C sort | uniq -c >&2
+	fi
+
+	if [[ -n "${watch:-}" ]]; then
+		echo >&2 "NOTICE: Watched module '${watch}' has final category '${modcat["${watch}"]}'"
 	fi
 
 	(( verbose )) && echo >&2 "Producing output file ..."
@@ -175,26 +209,30 @@ function main() {
 modules=''
 	EOF
 
-	#local -a loaded
-	#loaded=( $( lsmod | tail -n +2 | cut -d' ' -f 1 ) )
+	local -a dependency
+	readarray -t dependency < <( lsmod | tail -n +2 | sed 's/^\([a-zA-Z0-9_]\+\)\s\+\([0-9]\+\)\s\+\([0-9]\+\)\s*\(.*\)\?$/\1: \4/ ; s/,/ /g' | grep -v ': $' | cut -d':' -f 1 )
 
-	local -a autoloaded
-	autoloaded=( $( lsmod | tail -n +2 | sed 's/^\([a-zA-Z0-9_]\+\)\s\+\([0-9]\+\)\s\+\([0-9]\+\)\s*\(.*\)\?$/\1: \4/ ; s/,/ /g' | grep -v ': $' | cut -d':' -f 1 ) )
+	local -a leafnode
+	#leafnode=( $( lsmod | tail -n +2 | grep '\s[0-9]\+\s\+[0-9]\+$' | cut -d' ' -f 1 ) )
+	readarray -t leafnode < <( lsmod | tail -n +2 | sed 's/^\([a-zA-Z0-9_]\+\)\s\+\([0-9]\+\)\s\+\([0-9]\+\)\s*\(.*\)\?$/\1: \4/ ; s/,/ /g' | grep ': $' | cut -d':' -f 1 )
 
-	local -a requested
-	requested=( $( lsmod | tail -n +2 | grep '\s[0-9]\+\s\+[0-9]\+$' | cut -d' ' -f 1 ) )
+	if [[ -n "${watch:-}" ]]; then
+		grep -q " ${watch} " <<<" ${dependency[*]} " && echo >&2 "NOTICE: Watched module '${watch}' is in a dependency chain"
+		grep -q " ${watch} " <<<" ${leafnode[*]} " && echo >&2 "NOTICE: Watched module '${watch}' is a leaf-node"
+	fi
 
-	if (( ${#requested[@]} )); then
-		for category in $(
-			for module in "${!modcat[@]}"; do
-				echo "${modcat[${module}]}"
-			done | LC_ALL=C sort | uniq
-		); do
+	if (( ${#leafnode[@]} )); then
+		# For each (potentially squashed) category ...
+		for category in "${categories[@]}"; do
 			local -a list=()
 
+			# ... and then build a list of every leaf-node module in the current category.
 			for module in "${!modcat[@]}"; do
-				[[ "${modcat[${module}]}" == "${category}" ]] &&
-					grep -qw "${module}" <<<"${requested[*]}" &&
+				# For each module check whether the assigned category is the current one
+				# and, if so, see whether the module in question is amongst the leaf-node modules
+				# and add it to the list.
+				[[ "${modcat["${module}"]}" == "${category}" ]] &&
+					grep -q " ${module} " <<<" ${leafnode[*]} " &&
 					list+=( "${module}" )
 			done
 			(( ${#list[@]} )) && echo -e "\n# ${category}:\n#\nmodules=\"\${modules} ${list[*]}\""
@@ -202,11 +240,11 @@ modules=''
 			unset list
 
 			local -i output=0
-			local entry key desc type
+			local entry key type # desc
 
 			for module in "${!modcat[@]}"; do
-				if [[ "${modcat[${module}]}" == "${category}" ]]; then
-					if grep -qw "${module}" <<<"${requested[*]}"; then
+				if [[ "${modcat["${module}"]}" == "${category}" ]]; then
+					if grep -qw "${module}" <<<"${leafnode[*]}"; then
 						if modinfo "${module}" | grep -q '^parm:'; then
 							output=0
 							echo -n "#module_${module//-/_}_args=\""
@@ -214,10 +252,10 @@ modules=''
 								key="$( cut -d':' -f 1 <<<"${entry}" )"
 								if [[ "${entry}" == "${key}:bool" ]]; then
 									type="bool"
-									desc="None provided"
+									#desc="None provided"
 								else
 									type="$( rev <<<"${entry}" | grep -o '^)[^(]\+(' | rev | sed 's/[()]//g' )"
-									desc="$( sed "s/^${key}:\(.*\) (${type})/\1/" <<<"${entry}" )"
+									#desc="$( sed "s/^${key}:\(.*\) (${type})/\1/" <<<"${entry}" )"
 								fi
 
 								(( output )) && echo -n ','
@@ -238,11 +276,11 @@ modules=''
 				fi
 			done | LC_ALL=C sort | uniq
 
-			unset type desc key entry output
+			unset type key entry output # desc
 		done
 	fi
 
-	if (( ${#autoloaded[@]} )); then
+	if (( ${#dependency[@]} )); then
 		cat <<-EOF
 
 # Dependent modules
@@ -253,14 +291,14 @@ modules=''
 		EOF
 		for category in $(
 			for module in "${!modcat[@]}"; do
-				echo "${modcat[${module}]}"
+				echo "${modcat["${module}"]}"
 			done | LC_ALL=C sort | uniq
 		); do
 			local -a list=()
 
 			for module in "${!modcat[@]}"; do
-				[[ "${modcat[${module}]}" == "${category}" ]] &&
-					grep -qw "${module}" <<<"${autoloaded[*]}" &&
+				[[ "${modcat["${module}"]}" == "${category}" ]] &&
+					grep -qw "${module}" <<<"${dependency[*]}" &&
 					list+=( "${module}" )
 			done
 			(( ${#list[@]} )) && echo -e "\n# ${category}:\n#\n#modules=\"\${modules} ${list[*]}\""
@@ -268,11 +306,11 @@ modules=''
 			unset list
 
 			local -i output=0
-			local entry key desc type
+			local entry key type # desc
 
 			for module in "${!modcat[@]}"; do
-				if [[ "${modcat[${module}]}" == "${category}" ]]; then
-					if grep -qw "${module}" <<<"${autoloaded[*]}"; then
+				if [[ "${modcat["${module}"]}" == "${category}" ]]; then
+					if grep -qw "${module}" <<<"${dependency[*]}"; then
 						if modinfo "${module}" | grep -q '^parm:'; then
 							output=0
 							echo -n "#module_${module//-/_}_args=\""
@@ -280,10 +318,10 @@ modules=''
 								key="$( cut -d':' -f 1 <<<"${entry}" )"
 								if [[ "${entry}" == "${key}:bool" ]]; then
 									type="bool"
-									desc=""
+									#desc=""
 								else
 									type="$( rev <<<"${entry}" | grep -o '^)[^(]\+(' | rev | sed 's/[()]//g' )"
-									desc="$( sed "s/^${key}:\(.*\) (${type})/\1/" <<<"${entry}" )"
+									#desc="$( sed "s/^${key}:\(.*\) (${type})/\1/" <<<"${entry}" )"
 								fi
 
 								(( output )) && echo -n ','
@@ -304,7 +342,7 @@ modules=''
 				fi
 			done | LC_ALL=C sort | uniq
 
-			unset type desc key entry output
+			unset type key entry output # desc
 		done
 	fi
 
@@ -313,7 +351,7 @@ modules=''
 # vi: set nowrap syntax=conf:
 	EOF
 
-	unset requested autoloaded # loaded
+	unset leafnode dependency
 
 	if (( "${#messages[@]}" )); then
 		local message
@@ -326,6 +364,8 @@ modules=''
 
 		unset message
 	fi
+
+	(( trace )) && set +o xtrace
 } # main
 
 main "${@:-}"

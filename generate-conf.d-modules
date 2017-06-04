@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2016 Stuart Shelton
+# Copyright 2016-2017 Stuart Shelton
 # Distributed under the terms of the GNU General Public License v2
 
 set -u
@@ -10,7 +10,7 @@ set -u
 # Create a file suitable for deployment to /etc/conf.d/modules on baselayout-2
 # Gentoo systems, based on currently loaded modules.  The modules list is
 # live-generated from the running system, with the option to attempt to load
-# all discovered modules and additionally list those which load successfully.
+# all discovered modules and list those which load successfully.
 # Additionally, modules parameters are also auto-populated.  Dependent modules
 # are listed with their options, but aren't explicitly loaded.
 #
@@ -144,33 +144,35 @@ function main() {
 
 	(( verbose )) && echo >&2 "Producing output file ..."
 	cat <<-EOF
-# /etc/conf.d/modules
-
-# You can define a list modules for a specific kernel version,
-# a released kernel version, a main kernel version or just a list.
+# Linux users can define a list of modules for a specific kernel version,
+# a released kernel version, a main kernel version or all kernel versions.
 # The most specific versioned variable will take precedence.
-#modules_2_6_23_gentoo_r5="ieee1394 ohci1394"
-#modules_2_6_23="tun ieee1394"
-#modules_2_6="tun"
-#modules_2="ipv6"
+# FreeBSD users can only use the modules="foo bar" setting.
+#modules_4_9_6_gentoo_r1="ieee1394 ohci1394"
+#modules_4_9_6="tun ieee1394"
+#modules_4_9="tun"
+#modules_4="ipv6"
 #modules="ohci1394"
 
-# You can give modules a different name when they load - the new name
+# Linux users can give modules a different name when they load - the new name
 # will also be used to pick arguments below.
-#modules="dummy:dummy1"
+# This is not supported on FreeBSD.
+#modules="modname:alias"
 
-# Give the modules some arguments if needed, per version if necessary.
+# Linux users can give the modules some arguments if needed, per version
+# if necessary.
 # Again, the most specific versioned variable will take precedence.
-#module_ieee1394_args="debug"
-#module_ieee1394_args_2_6_23_gentoo_r5="debug2"
-#module_ieee1394_args_2_6_23="debug3"
-#module_ieee1394_args_2_6="debug4"
-#module_ieee1394_args_2="debug5"
+# This is not supported on FreeBSD.
+#module_ieee1394_args_4_9_6_gentoo_r1="debug5"
+#module_ieee1394_args_4_9_6="debug4"
+#module_ieee1394_args_4_9="debug3"
+#module_ieee1394_args_4="debug2"
+#module_ieee1394_args="debug1"
 
 # You should consult your kernel documentation and configuration
 # for a list of modules and their options.
 
-modules=""
+modules=''
 	EOF
 
 	#local -a loaded
